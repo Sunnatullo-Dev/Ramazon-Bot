@@ -531,33 +531,36 @@ def video_kind_kb():
         [InlineKeyboardButton(text="📼 Uzun videolar", callback_data="watch:long")],
     ])
 
-def video_nav_kb(prev=None, next=None, autoplay=False):
+def video_nav_kb(prev=None, next=None, autoplay=False, kind="short"):
     rows = []
     nav = []
     if prev is not None:
-        nav.append(InlineKeyboardButton(text="⬅ Oldingi", callback_data=f"video:{prev}"))
+        nav.append(InlineKeyboardButton(text="⬅ Oldingi", callback_data=f"video:{kind}:{prev}"))
     if next is not None:
-        nav.append(InlineKeyboardButton(text="➡ Keyingi", callback_data=f"video:{next}"))
+        nav.append(InlineKeyboardButton(text="➡ Keyingi", callback_data=f"video:{kind}:{next}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="⏸ Avto OFF" if autoplay else "▶️ Avto ON", callback_data="autoplay_toggle")])
+    rows.append([InlineKeyboardButton(text="⏸ Avto OFF" if autoplay else "▶️ Avto ON", callback_data=f"atoggle:{kind}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ---------------- VIDEO SEND / EDIT ----------------
 async def send_and_track(chat_id: int, file_id: str, prev_idx: Optional[int], next_idx: Optional[int], autoplay: bool, kind: str):
-    sent = await bot.send_video(chat_id, video=file_id, reply_markup=video_nav_kb(prev_idx, next_idx, autoplay))
+    sent = await bot.send_video(chat_id, video=file_id, reply_markup=video_nav_kb(prev_idx, next_idx, autoplay, kind))
     CURRENT_INFO[chat_id] = {"chat_id": chat_id, "message_id": sent.message_id, "kind": kind}
     return sent
 
-async def edit_tracked(chat_id: int, file_id: str, prev_idx: Optional[int], next_idx: Optional[int], autoplay: bool):
+async def edit_tracked(chat_id: int, file_id: str, prev_idx: Optional[int], next_idx: Optional[int], autoplay: bool, kind: str = "short"):
     info = CURRENT_INFO.get(chat_id)
-    kb = video_nav_kb(prev_idx, next_idx, autoplay)
+    kb = video_nav_kb(prev_idx, next_idx, autoplay, kind)
     if not info:
         try:
-            await send_and_track(chat_id, file_id, prev_idx, next_idx, autoplay, "short")
+            # If state is lost, we try to rebuild it
+            await send_and_track(chat_id, file_id, prev_idx, next_idx, autoplay, kind)
             return True
         except:
             return False
+    # Update state just in case
+    info["kind"] = kind
     try:
         await bot.edit_message_media(
             chat_id=info["chat_id"],
@@ -568,7 +571,7 @@ async def edit_tracked(chat_id: int, file_id: str, prev_idx: Optional[int], next
         return True
     except Exception:
         try:
-            await send_and_track(chat_id, file_id, prev_idx, next_idx, autoplay, info.get("kind", "short"))
+            await send_and_track(chat_id, file_id, prev_idx, next_idx, autoplay, kind)
             return True
         except:
             return False
@@ -592,7 +595,7 @@ async def autoplay_worker(chat_id: int, start_idx: int):
             break
         prev = idx - 1 if idx > 0 else None
         nxt = idx + 1 if idx + 1 < len(playlist) else None
-        ok = await edit_tracked(chat_id, playlist[idx]["file_id"], prev, nxt, True)
+        ok = await edit_tracked(chat_id, playlist[idx]["file_id"], prev, nxt, True, kind)
         if not ok:
             break
         CURRENT_INDEX[chat_id] = idx
@@ -913,42 +916,53 @@ async def cb_watch(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("video:"))
 async def cb_video_nav(c: CallbackQuery):
     await c.answer()
+    parts = c.data.split(":")
+    if len(parts) < 3:
+        return await c.message.answer("Xato ma'lumot.")
+    kind = parts[1]
     try:
-        idx = int(c.data.split(":", 1)[1])
+        idx = int(parts[2])
     except:
-        return await c.message.answer("Xato.")
-    info = CURRENT_INFO.get(c.message.chat.id)
-    if not info:
-        return await c.message.answer("Avval tur tanlang.")
-    kind = info["kind"]
+        return await c.message.answer("Index xatosi.")
+
     playlist = get_filtered(kind)
+    if not playlist:
+        return await c.message.answer("Video topilmadi.")
+
     if idx < 0 or idx >= len(playlist):
         return
+
     prev = idx - 1 if idx > 0 else None
     nxt = idx + 1 if idx + 1 < len(playlist) else None
-    ok = await edit_tracked(c.message.chat.id, playlist[idx]["file_id"], prev, nxt, AUTO_PLAY.get(c.message.chat.id, False))
+    autoplay = AUTO_PLAY.get(c.message.chat.id, False)
+    
+    ok = await edit_tracked(c.message.chat.id, playlist[idx]["file_id"], prev, nxt, autoplay, kind)
     if ok:
         CURRENT_INDEX[c.message.chat.id] = idx
 
-@dp.callback_query(F.data == "autoplay_toggle")
+@dp.callback_query(F.data.startswith("atoggle:"))
 async def cb_autoplay_toggle(c: CallbackQuery):
     await c.answer()
+    parts = c.data.split(":")
+    kind = parts[1] if len(parts) > 1 else "short"
     chat_id = c.message.chat.id
-    info = CURRENT_INFO.get(chat_id)
-    if not info:
-        return await c.message.answer("Playlist ochilmagan.")
+    
     current = AUTO_PLAY.get(chat_id, False)
     idx = CURRENT_INDEX.get(chat_id, 0)
-    kind = info["kind"]
     playlist = get_filtered(kind)
+    
+    # Update or rebuild internal state
+    if chat_id not in CURRENT_INFO:
+        CURRENT_INFO[chat_id] = {"chat_id": chat_id, "message_id": c.message.message_id, "kind": kind}
+
     if current:
         AUTO_PLAY[chat_id] = False
         task = AUTO_TASKS.pop(chat_id, None)
         if task:
             task.cancel()
         await bot.edit_message_reply_markup(
-            chat_id=info["chat_id"], message_id=info["message_id"],
-            reply_markup=video_nav_kb(idx-1 if idx>0 else None, idx+1 if idx+1<len(playlist) else None, False)
+            chat_id=chat_id, message_id=c.message.message_id,
+            reply_markup=video_nav_kb(idx-1 if idx>0 else None, idx+1 if idx+1<len(playlist) else None, False, kind)
         )
         await c.message.answer("Avtoplay o'chirildi")
     else:
@@ -956,8 +970,8 @@ async def cb_autoplay_toggle(c: CallbackQuery):
         task = asyncio.create_task(autoplay_worker(chat_id, idx))
         AUTO_TASKS[chat_id] = task
         await bot.edit_message_reply_markup(
-            chat_id=info["chat_id"], message_id=info["message_id"],
-            reply_markup=video_nav_kb(idx-1 if idx>0 else None, idx+1 if idx+1<len(playlist) else None, True)
+            chat_id=chat_id, message_id=c.message.message_id,
+            reply_markup=video_nav_kb(idx-1 if idx>0 else None, idx+1 if idx+1<len(playlist) else None, True, kind)
         )
         await c.message.answer("Avtoplay yoqildi")
 
