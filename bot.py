@@ -93,6 +93,39 @@ BUILTIN_DUO_MEANING = {
     "Iftorlik duosi": "Ma'nosi: Allohim! Ushbu Ro'zamni Sen Uchun Tutdim ,Va Senga Iymon Keltirdim , Senga Tavakkal Qildim Va Bergan Rizqing Bilan Iftor Qildim. Mening Avvalgi Va Keyingi Gunohlaimni Mag'firat Qilgil. Vallohu A'lam..."
 }
 
+RAMADAN_2026_TASHKENT = {
+    "2026-02-18": {"bomdod": "05:55", "shom": "18:04"},
+    "2026-02-19": {"bomdod": "05:54", "shom": "18:05"},
+    "2026-02-20": {"bomdod": "05:53", "shom": "18:07"},
+    "2026-02-21": {"bomdod": "05:51", "shom": "18:08"},
+    "2026-02-22": {"bomdod": "05:50", "shom": "18:09"},
+    "2026-02-23": {"bomdod": "05:49", "shom": "18:10"},
+    "2026-02-24": {"bomdod": "05:47", "shom": "18:11"},
+    "2026-02-25": {"bomdod": "05:46", "shom": "18:13"},
+    "2026-02-26": {"bomdod": "05:44", "shom": "18:14"},
+    "2026-02-27": {"bomdod": "05:43", "shom": "18:15"},
+    "2026-02-28": {"bomdod": "05:41", "shom": "18:16"},
+    "2026-03-01": {"bomdod": "05:40", "shom": "18:17"},
+    "2026-03-02": {"bomdod": "05:38", "shom": "18:19"},
+    "2026-03-03": {"bomdod": "05:37", "shom": "18:20"},
+    "2026-03-04": {"bomdod": "05:35", "shom": "18:21"},
+    "2026-03-05": {"bomdod": "05:34", "shom": "18:22"},
+    "2026-03-06": {"bomdod": "05:32", "shom": "18:23"},
+    "2026-03-07": {"bomdod": "05:31", "shom": "18:24"},
+    "2026-03-08": {"bomdod": "05:29", "shom": "18:25"},
+    "2026-03-09": {"bomdod": "05:27", "shom": "18:27"},
+    "2026-03-10": {"bomdod": "05:26", "shom": "18:28"},
+    "2026-03-11": {"bomdod": "05:24", "shom": "18:29"},
+    "2026-03-12": {"bomdod": "05:22", "shom": "18:30"},
+    "2026-03-13": {"bomdod": "05:21", "shom": "18:31"},
+    "2026-03-14": {"bomdod": "05:19", "shom": "18:32"},
+    "2026-03-15": {"bomdod": "05:17", "shom": "18:33"},
+    "2026-03-16": {"bomdod": "05:15", "shom": "18:34"},
+    "2026-03-17": {"bomdod": "05:14", "shom": "18:35"},
+    "2026-03-18": {"bomdod": "05:12", "shom": "18:37"},
+    "2026-03-19": {"bomdod": "05:10", "shom": "18:38"},
+}
+
 _prayer_cache = {}
 _prayer_cache_time = {}
 
@@ -301,7 +334,7 @@ async def add_duo_db(title, text, added_by):
 
 async def list_duos_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute("SELECT id, title, text FROM duolar ORDER BY id DESC")
+        cur = await db.execute("SELECT id, title, text FROM duolar ORDER BY id ASC")
         return await cur.fetchall()
 
 async def increment_duo_stat(name: str):
@@ -399,6 +432,13 @@ async def fetch_prayer_namozvaqti(region_slug: str, target_date: datetime = None
         target_date = datetime.now()
     key = f"{region_slug}|{target_date.strftime('%Y-%m-%d')}"
     now = datetime.now()
+
+    # Check fixed Ramadan 2026 times for Tashkent
+    if region_slug in (None, "", "toshkent", "toshkent-shahri"):
+        date_str = target_date.strftime("%Y-%m-%d")
+        if date_str in RAMADAN_2026_TASHKENT:
+            return RAMADAN_2026_TASHKENT[date_str]
+
     if key in _prayer_cache and (now - _prayer_cache_time.get(key, now)).total_seconds() < PRAYER_CACHE_TTL:
         return _prayer_cache[key]
 
@@ -438,8 +478,7 @@ async def fetch_prayer_namozvaqti(region_slug: str, target_date: datetime = None
     except Exception as e:
         log.exception("namoz-vaqti.uz failed: %s", e)
 
-    # fallback: AlAdhan
-    try:
+    # fallback: AlAdhan  
         params2 = {
             "city": region_slug or "Tashkent",
             "country": "Uzbekistan",
