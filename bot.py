@@ -196,6 +196,51 @@ AUTO_TASKS = {}      # chat_id -> asyncio.Task
 CURRENT_INDEX = {}   # chat_id -> index
 CURRENT_INFO = {}    # chat_id -> dict
 
+# Message queue system - keeps max 2 messages per user
+USER_MSG_QUEUE = {}  # user_id -> [msg_id1, msg_id2]
+MAX_USER_MESSAGES = 2
+
+# Debounce system - prevents duplicate callback processing
+LAST_CALLBACK = {}   # user_id -> (callback_data, timestamp)
+DEBOUNCE_SECONDS = 1.0  # minimum seconds between same callbacks
+
+async def send_queued_message(chat_id: int, user_id: int, text: str, **kwargs):
+    """Send message and manage queue - delete oldest if more than MAX_USER_MESSAGES"""
+    # Initialize queue for user if not exists
+    if user_id not in USER_MSG_QUEUE:
+        USER_MSG_QUEUE[user_id] = []
+    
+    queue = USER_MSG_QUEUE[user_id]
+    
+    # If queue is full, delete the oldest message
+    if len(queue) >= MAX_USER_MESSAGES:
+        oldest_msg_id = queue.pop(0)
+        try:
+            await bot.delete_message(chat_id, oldest_msg_id)
+        except Exception:
+            pass  # Message might already be deleted
+    
+    # Send new message
+    sent = await bot.send_message(chat_id, text, **kwargs)
+    
+    # Add new message to queue
+    queue.append(sent.message_id)
+    
+    return sent
+
+def is_duplicate_callback(user_id: int, callback_data: str) -> bool:
+    """Check if this is a duplicate callback (same callback within DEBOUNCE_SECONDS)"""
+    now = datetime.now().timestamp()
+    key = user_id
+    
+    if key in LAST_CALLBACK:
+        last_data, last_time = LAST_CALLBACK[key]
+        if last_data == callback_data and (now - last_time) < DEBOUNCE_SECONDS:
+            return True
+    
+    LAST_CALLBACK[key] = (callback_data, now)
+    return False
+
 # ---------------- DB ----------------
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
@@ -361,7 +406,7 @@ async def update_ad_sent_count(ad_id: int, sent_count: int, meta: str = ""):
         await db.execute("UPDATE ads SET sent_count = ?, meta = ? WHERE id = ?", (sent_count, meta, ad_id))
         await db.commit()
 
-# ---------------- PRAYER TIMES (islom.uz parser) ----------------
+# ---------------- PRAYER TIMES (islom.uz parser) ----------------  
 LABEL_TO_KEY = {
     "Тонг": "bomdod",
     "Қуёш": "quyosh",
@@ -687,6 +732,8 @@ async def cmd_start(message: Message):
 @dp.callback_query(lambda c: c.data == "menu:ramadan")
 async def cb_ramadan(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     rows = []
     for i in range(0, len(REGIONS), 2):
         row = [InlineKeyboardButton(text=REGIONS[i][0], callback_data=f"region:{i}")]
@@ -694,17 +741,19 @@ async def cb_ramadan(c: CallbackQuery):
             row.append(InlineKeyboardButton(text=REGIONS[i + 1][0], callback_data=f"region:{i+1}"))
         rows.append(row)
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await c.message.answer("📍 Viloyatingizni tanlang:", reply_markup=kb)
+    await send_queued_message(c.message.chat.id, c.from_user.id, "📍 Viloyatingizni tanlang:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("region:"))
 async def cb_region(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     try:
         idx = int(c.data.split(":", 1)[1])
     except:
-        return await c.message.answer("Xato viloyat.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato viloyat.")
     if idx < 0 or idx >= len(REGIONS):
-        return await c.message.answer("Noto'g'ri viloyat.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Noto'g'ri viloyat.")
     display, slug = REGIONS[idx]
     await set_user_region_db(c.from_user.id, slug)
 
@@ -722,17 +771,19 @@ async def cb_region(c: CallbackQuery):
     if row:
         rows.append(row)
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await c.message.answer(f"📍 {display}\nRamazon kunini tanlang:", reply_markup=kb)
+    await send_queued_message(c.message.chat.id, c.from_user.id, f"📍 {display}\nRamazon kunini tanlang:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("ramday:"))
 async def cb_ramday(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     try:
         _, idx_s, day_s = c.data.split(":")
         idx = int(idx_s)
         day = int(day_s)
     except:
-        return await c.message.answer("Xato ma'lumot.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato ma'lumot.")
     display, slug = REGIONS[idx]
     start = datetime.fromisoformat(RAMADAN_START_DATE).date()
     date = start + timedelta(days=day - 1)
@@ -743,22 +794,24 @@ async def cb_ramday(c: CallbackQuery):
     shom = shom[:5]
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⏰ Saharlik — {fajr}", callback_data=f"time:{idx}:{day}:sahar:{date.strftime('%Y-%m-%d')}"),
                                                 InlineKeyboardButton(text=f"🌇 Iftorlik — {shom}", callback_data=f"time:{idx}:{day}:iftor:{date.strftime('%Y-%m-%d')}")]])
-    await c.message.answer(f"📍 {display}\nRamazon {day}-kun ({date})\nSaharlik: {fajr}\nIftorlik: {shom}\n\nTanlang:", reply_markup=kb)
+    await send_queued_message(c.message.chat.id, c.from_user.id, f"📍 {display}\nRamazon {day}-kun ({date})\nSaharlik: {fajr}\nIftorlik: {shom}\n\nTanlang:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("time:"))
 async def cb_time(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     try:
         _, idx_s, day_s, ttype, date_str = c.data.split(":")
         idx = int(idx_s)
         day = int(day_s)
     except:
-        return await c.message.answer("Xato.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato.")
     display, slug = REGIONS[idx]
     date = datetime.fromisoformat(date_str)
     times = await fetch_prayer_namozvaqti(slug, date)
     if not times:
-        return await c.message.answer("Namoz vaqtlari topilmadi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Namoz vaqtlari topilmadi.")
     if ttype == 'sahar':
         key = 'Saharlik duosi'
         time_val = (times.get('bomdod') or times.get('Fajr') or '—:--')[:5]
@@ -767,27 +820,31 @@ async def cb_time(c: CallbackQuery):
         time_val = (times.get('shom') or times.get('Maghrib') or '—:--')[:5]
     duo = BUILTIN_DUOS.get(key, 'Duo topilmadi.')
     meaning = BUILTIN_DUO_MEANING.get(key, '')
-    await c.message.answer(f"🤲 {key} — {time_val}\n\n{duo}\n\n{meaning}")
+    await send_queued_message(c.message.chat.id, c.from_user.id, f"🤲 {key} — {time_val}\n\n{duo}\n\n{meaning}")
 
 @dp.callback_query(lambda c: c.data == "menu:prayer")
 async def cb_prayer(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     u = await get_user_db(c.from_user.id)
     slug = u[3] if u and u[3] else 'toshkent-shahri'
     times = await fetch_prayer_namozvaqti(slug)
     if not times:
-        return await c.message.answer("Namoz vaqtlari topilmadi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Namoz vaqtlari topilmadi.")
     order = ['bomdod', 'quyosh', 'peshin', 'asr', 'shom', 'xufton']
     labels = {'bomdod':'Bomdod','quyosh':'Quyosh','peshin':'Peshin','asr':'Asr','shom':'Shom','xufton':'Xufton'}
     lines = []
     for k in order:
         v = times.get(k) or times.get(k.capitalize()) or times.get(k.upper()) or "—:--"
         lines.append(f"{labels.get(k, k)}: {v[:5]}")
-    await c.message.answer("🕌 Namoz vaqtlari (bugun):\n\n" + "\n".join(lines))
+    await send_queued_message(c.message.chat.id, c.from_user.id, "🕌 Namoz vaqtlari (bugun):\n\n" + "\n".join(lines))
 
 @dp.callback_query(lambda c: c.data == "menu:duos")
 async def cb_duos(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     is_adm = await is_admin(c.from_user.id)
     db_duos = await list_duos_db()
     items = list(BUILTIN_DUOS.items()) + [(t, tx) for _, t, tx in db_duos]
@@ -801,69 +858,75 @@ async def cb_duos(c: CallbackQuery):
         rows.append([InlineKeyboardButton(text=label, callback_data=f"duo_open:{i}")])
     rows.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="duos:back")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await c.message.answer("🤲 Duolar:", reply_markup=kb)
+    await send_queued_message(c.message.chat.id, c.from_user.id, "🤲 Duolar:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("duos:"))
 async def cb_duos_actions(c: CallbackQuery, state: FSMContext):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     action = c.data.split(":", 1)[1]
     if action == "back":
-        await c.message.answer("Orqaga", reply_markup=build_main_inline())
+        await send_queued_message(c.message.chat.id, c.from_user.id, "Orqaga", reply_markup=build_main_inline())
         return
     if action == "add":
         if not await is_admin(c.from_user.id):
-            return await c.message.answer("Admin emassiz.")
+            return await send_queued_message(c.message.chat.id, c.from_user.id, "Admin emassiz.")
         await state.set_state(StateDuoAdd.waiting_title)
-        await c.message.answer("Duo nomini kiriting:")
+        await send_queued_message(c.message.chat.id, c.from_user.id, "Duo nomini kiriting:")
         return
     if action == "admin_delete":
         if not await is_admin(c.from_user.id):
-            return await c.message.answer("Admin emassiz.")
+            return await send_queued_message(c.message.chat.id, c.from_user.id, "Admin emassiz.")
         db_duos = await list_duos_db()
         if not db_duos:
-            return await c.message.answer("Bazada duo yo'q.")
+            return await send_queued_message(c.message.chat.id, c.from_user.id, "Bazada duo yo'q.")
         rows = []
         for id_, title, _ in db_duos:
             rows.append([InlineKeyboardButton(text=title[:30], callback_data=f"duo_del:{id_}")])
         rows.append([InlineKeyboardButton(text="🔙 Bekor", callback_data="duo_del:cancel")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await c.message.answer("Qaysi duoni o'chirmoqchisiz?", reply_markup=kb)
+        await send_queued_message(c.message.chat.id, c.from_user.id, "Qaysi duoni o'chirmoqchisiz?", reply_markup=kb)
         return
 
 @dp.callback_query(F.data.startswith("duo_open:"))
 async def cb_duo_open(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     try:
         idx = int(c.data.split(":", 1)[1])
     except:
-        return await c.message.answer("Xato.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato.")
     db_duos = await list_duos_db()
     items = list(BUILTIN_DUOS.items()) + [(t, tx) for _, t, tx in db_duos]
     if idx >= len(items):
-        return await c.message.answer("Duo topilmadi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Duo topilmadi.")
     title, text = items[idx]
     await increment_duo_stat(title)
-    await c.message.answer(f"🤲 {title}\n\n{text}")
+    await send_queued_message(c.message.chat.id, c.from_user.id, f"🤲 {title}\n\n{text}")
 
 @dp.callback_query(F.data.startswith("duo_del:"))
 async def cb_duo_del(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     payload = c.data.split(":", 1)[1]
     if payload == "cancel":
         try:
             await c.message.delete_reply_markup()
         except:
             pass
-        return await c.message.answer("Bekor qilindi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Bekor qilindi.")
     try:
         duo_id = int(payload)
     except:
-        return await c.message.answer("Xato.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato.")
     async with aiosqlite.connect(DB_FILE) as db:
         cur = await db.execute("SELECT title FROM duolar WHERE id = ?", (duo_id,))
         row = await cur.fetchone()
         if not row:
-            return await c.message.answer("Duo topilmadi.")
+            return await send_queued_message(c.message.chat.id, c.from_user.id, "Duo topilmadi.")
         title = row[0]
         await db.execute("DELETE FROM duolar WHERE id = ?", (duo_id,))
         await db.execute("DELETE FROM duo_stats WHERE name = ?", (title,))
@@ -871,7 +934,7 @@ async def cb_duo_del(c: CallbackQuery):
     try:
         await c.message.edit_text(f"✅ Duo '{title}' o'chirildi.")
     except:
-        await c.message.answer(f"✅ Duo '{title}' o'chirildi.")
+        await send_queued_message(c.message.chat.id, c.from_user.id, f"✅ Duo '{title}' o'chirildi.")
 
 @dp.message(StateDuoAdd.waiting_title)
 async def duo_title(m: Message, state: FSMContext):
@@ -896,15 +959,19 @@ async def duo_text(m: Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "menu:videos")
 async def cb_videos_menu(c: CallbackQuery):
     await c.answer()
-    await c.message.answer("Domlolar va Hadislar videolari:", reply_markup=video_kind_kb())
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
+    await send_queued_message(c.message.chat.id, c.from_user.id, "Domlolar va Hadislar videolari:", reply_markup=video_kind_kb())
 
 @dp.callback_query(F.data.startswith("watch:"))
 async def cb_watch(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     kind = c.data.split(":", 1)[1]
     playlist = get_filtered(kind)
     if not playlist:
-        return await c.message.answer(f"Bu turda video hali yo'q.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, f"Bu turda video hali yo'q.")
     idx = 0
     CURRENT_INDEX[c.message.chat.id] = idx
     AUTO_PLAY[c.message.chat.id] = False
@@ -916,18 +983,20 @@ async def cb_watch(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("video:"))
 async def cb_video_nav(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     parts = c.data.split(":")
     if len(parts) < 3:
-        return await c.message.answer("Xato ma'lumot.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato ma'lumot.")
     kind = parts[1]
     try:
         idx = int(parts[2])
     except:
-        return await c.message.answer("Index xatosi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Index xatosi.")
 
     playlist = get_filtered(kind)
     if not playlist:
-        return await c.message.answer("Video topilmadi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Video topilmadi.")
 
     if idx < 0 or idx >= len(playlist):
         return
@@ -943,6 +1012,8 @@ async def cb_video_nav(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("atoggle:"))
 async def cb_autoplay_toggle(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     parts = c.data.split(":")
     kind = parts[1] if len(parts) > 1 else "short"
     chat_id = c.message.chat.id
@@ -964,7 +1035,6 @@ async def cb_autoplay_toggle(c: CallbackQuery):
             chat_id=chat_id, message_id=c.message.message_id,
             reply_markup=video_nav_kb(idx-1 if idx>0 else None, idx+1 if idx+1<len(playlist) else None, False, kind)
         )
-        await c.message.answer("Avtoplay o'chirildi")
     else:
         AUTO_PLAY[chat_id] = True
         task = asyncio.create_task(autoplay_worker(chat_id, idx))
@@ -973,7 +1043,6 @@ async def cb_autoplay_toggle(c: CallbackQuery):
             chat_id=chat_id, message_id=c.message.message_id,
             reply_markup=video_nav_kb(idx-1 if idx>0 else None, idx+1 if idx+1<len(playlist) else None, True, kind)
         )
-        await c.message.answer("Avtoplay yoqildi")
 
 # ---------------- ADMIN HANDLERS ----------------
 @dp.message(Command("admin"))
@@ -1185,25 +1254,27 @@ async def video_del_start(m: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("delvid:"))
 async def video_del_callback(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     payload = c.data.split(":", 1)[1]
     if payload == "cancel":
         try:
             await c.message.delete_reply_markup()
         except:
             pass
-        return await c.message.answer("Bekor qilindi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Bekor qilindi.")
     try:
         pos = int(payload)
     except:
-        return await c.message.answer("Xato raqam.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato raqam.")
     ok, rem = remove_video_by_pos(pos)
     if ok:
         try:
             await c.message.edit_text(f"🗑 #{pos} o'chirildi ({rem.get('kind')})")
         except:
-            await c.message.answer(f"🗑 #{pos} o'chirildi ({rem.get('kind')})")
+            await send_queued_message(c.message.chat.id, c.from_user.id, f"🗑 #{pos} o'chirildi ({rem.get('kind')})")
     else:
-        await c.message.answer("Bunday raqam yo'q.")
+        await send_queued_message(c.message.chat.id, c.from_user.id, "Bunday raqam yo'q.")
 
 # ---------------- ADMIN ADD / REMOVE ----------------
 @dp.message(F.text == "➕ Admin qo'shish")
@@ -1248,22 +1319,24 @@ async def admin_remove_start(m: Message):
 @dp.callback_query(F.data.startswith("admin_del:"))
 async def admin_del_callback(c: CallbackQuery):
     await c.answer()
+    if is_duplicate_callback(c.from_user.id, c.data):
+        return
     payload = c.data.split(":", 1)[1]
     if payload == "cancel":
         try:
             await c.message.delete_reply_markup()
         except:
             pass
-        return await c.message.answer("Bekor qilindi.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Bekor qilindi.")
     try:
         aid = int(payload)
     except:
-        return await c.message.answer("Xato ID.")
+        return await send_queued_message(c.message.chat.id, c.from_user.id, "Xato ID.")
     await remove_admin_db(aid)
     try:
         await c.message.edit_text(f"✅ Admin {aid} o'chirildi.")
     except:
-        await c.message.answer(f"✅ Admin {aid} o'chirildi.")
+        await send_queued_message(c.message.chat.id, c.from_user.id, f"✅ Admin {aid} o'chirildi.")
 
 # ---------------- STARTUP ----------------
 async def periodic_cache():
