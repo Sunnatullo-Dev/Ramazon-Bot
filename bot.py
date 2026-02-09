@@ -43,7 +43,7 @@ if not BOT_TOKEN:
 INITIAL_ADMINS = [7566796449]
 
 DB_FILE = os.getenv("DB_FILE", "ramazon_full.db")
-RAMADAN_START_DATE = os.getenv("RAMADAN_START_DATE", "2026-02-18")  # YYYY-MM-DD
+RAMADAN_START_DATE = os.getenv("RAMADAN_START_DATE", "2026-02-19")  # YYYY-MM-DD (19-fevral)
 PRAYER_SOURCE = "islom.uz"                 # primary source
 NAMOZVAQTI_BASE = "https://namoz-vaqti.uz/"
 ALADHAN_BASE = "http://api.aladhan.com/v1/timingsByCity"
@@ -94,7 +94,6 @@ BUILTIN_DUO_MEANING = {
 }
 
 RAMADAN_2026_TASHKENT = {
-    "2026-02-18": {"bomdod": "05:55", "shom": "18:04"},
     "2026-02-19": {"bomdod": "05:54", "shom": "18:05"},
     "2026-02-20": {"bomdod": "05:53", "shom": "18:07"},
     "2026-02-21": {"bomdod": "05:51", "shom": "18:08"},
@@ -124,7 +123,26 @@ RAMADAN_2026_TASHKENT = {
     "2026-03-17": {"bomdod": "05:14", "shom": "18:35"},
     "2026-03-18": {"bomdod": "05:12", "shom": "18:37"},
     "2026-03-19": {"bomdod": "05:10", "shom": "18:38"},
+    "2026-03-20": {"bomdod": "05:08", "shom": "18:39"},
 }
+
+# Oy nomlari (qisqa va to'liq)
+MONTH_NAMES_SHORT = {
+    1: "yan", 2: "fev", 3: "mar", 4: "apr", 5: "may", 6: "iyn",
+    7: "iyl", 8: "avg", 9: "sen", 10: "okt", 11: "noy", 12: "dek"
+}
+MONTH_NAMES_FULL = {
+    1: "yanvar", 2: "fevral", 3: "mart", 4: "aprel", 5: "may", 6: "iyun",
+    7: "iyul", 8: "avgust", 9: "sentabr", 10: "oktabr", 11: "noyabr", 12: "dekabr"
+}
+
+def format_date_short(date_obj):
+    """Format date as '19-fev' style"""
+    return f"{date_obj.day}-{MONTH_NAMES_SHORT[date_obj.month]}"
+
+def format_date_full(date_obj):
+    """Format date as '19-fevral' style"""
+    return f"{date_obj.day}-{MONTH_NAMES_FULL[date_obj.month]}"
 
 _prayer_cache = {}
 _prayer_cache_time = {}
@@ -204,6 +222,10 @@ MAX_USER_MESSAGES = 2
 LAST_CALLBACK = {}   # user_id -> (callback_data, timestamp)
 DEBOUNCE_SECONDS = 1.0  # minimum seconds between same callbacks
 
+# Start command debounce - prevents duplicate /start processing
+LAST_START = {}  # user_id -> timestamp
+START_DEBOUNCE_SECONDS = 2.0  # minimum seconds between /start commands
+
 async def send_queued_message(chat_id: int, user_id: int, text: str, **kwargs):
     """Send message and manage queue - delete oldest if more than MAX_USER_MESSAGES"""
     # Initialize queue for user if not exists
@@ -239,6 +261,22 @@ def is_duplicate_callback(user_id: int, callback_data: str) -> bool:
             return True
     
     LAST_CALLBACK[key] = (callback_data, now)
+    return False
+
+# Video navigation debounce - tracks ANY video button press, not just same button
+LAST_VIDEO_NAV = {}  # user_id -> timestamp
+VIDEO_NAV_DEBOUNCE = 1.5  # seconds between ANY video navigation
+
+def is_video_nav_spam(user_id: int) -> bool:
+    """Check if user is spamming video navigation buttons"""
+    now = datetime.now().timestamp()
+    
+    if user_id in LAST_VIDEO_NAV:
+        last_time = LAST_VIDEO_NAV[user_id]
+        if (now - last_time) < VIDEO_NAV_DEBOUNCE:
+            return True
+    
+    LAST_VIDEO_NAV[user_id] = now
     return False
 
 # ---------------- DB ----------------
@@ -724,6 +762,17 @@ async def daily_namaz_updater_loop():
 # ---------------- HANDLERS ----------------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    # Debounce check to prevent duplicate /start processing
+    user_id = message.from_user.id
+    now = datetime.now().timestamp()
+    
+    if user_id in LAST_START:
+        last_time = LAST_START[user_id]
+        if (now - last_time) < START_DEBOUNCE_SECONDS:
+            return  # Ignore duplicate /start within debounce period
+    
+    LAST_START[user_id] = now
+    
     first = message.from_user.first_name or "Do'st"
     username = message.from_user.username
     await add_user_db(message.from_user.id, first, username)
@@ -757,13 +806,21 @@ async def cb_region(c: CallbackQuery):
     display, slug = REGIONS[idx]
     await set_user_region_db(c.from_user.id, slug)
 
-    today_day = (datetime.utcnow().date() - datetime.fromisoformat(RAMADAN_START_DATE).date()).days + 1
+    today_date = (datetime.utcnow() + timedelta(hours=5)).date()  # Toshkent vaqti
+    ramadan_start = datetime.fromisoformat(RAMADAN_START_DATE).date()
     rows = []
     row = []
     for d in range(1, 31):
-        label = f"{d}-kun"
-        if today_day == d:
-            label = f"🌟 {d}-kun"
+        # Haqiqiy sanani hisoblash
+        current_date = ramadan_start + timedelta(days=d - 1)
+        date_label = format_date_short(current_date)  # "19-fev" formatida
+        
+        # Bugungi kun bo'lsa yulduz qo'shish
+        if current_date == today_date:
+            label = f"🌟 {date_label}"
+        else:
+            label = date_label
+        
         row.append(InlineKeyboardButton(text=label, callback_data=f"ramday:{idx}:{d}"))
         if len(row) == 5:
             rows.append(row)
@@ -771,7 +828,7 @@ async def cb_region(c: CallbackQuery):
     if row:
         rows.append(row)
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await send_queued_message(c.message.chat.id, c.from_user.id, f"📍 {display}\nRamazon kunini tanlang:", reply_markup=kb)
+    await send_queued_message(c.message.chat.id, c.from_user.id, f"📍 {display}\n🌙 Ramazon taqvimi (19-fevral — 20-mart)\nKunni tanlang:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("ramday:"))
 async def cb_ramday(c: CallbackQuery):
@@ -787,6 +844,7 @@ async def cb_ramday(c: CallbackQuery):
     display, slug = REGIONS[idx]
     start = datetime.fromisoformat(RAMADAN_START_DATE).date()
     date = start + timedelta(days=day - 1)
+    date_str = format_date_full(date)  # "19-fevral" formatida
     times = await fetch_prayer_namozvaqti(slug, date)
     fajr = times.get('bomdod') or times.get('Fajr') or '—:--' if times else '—:--'
     shom = times.get('shom') or times.get('Maghrib') or '—:--' if times else '—:--'
@@ -794,7 +852,7 @@ async def cb_ramday(c: CallbackQuery):
     shom = shom[:5]
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⏰ Saharlik — {fajr}", callback_data=f"time:{idx}:{day}:sahar:{date.strftime('%Y-%m-%d')}"),
                                                 InlineKeyboardButton(text=f"🌇 Iftorlik — {shom}", callback_data=f"time:{idx}:{day}:iftor:{date.strftime('%Y-%m-%d')}")]])
-    await send_queued_message(c.message.chat.id, c.from_user.id, f"📍 {display}\nRamazon {day}-kun ({date})\nSaharlik: {fajr}\nIftorlik: {shom}\n\nTanlang:", reply_markup=kb)
+    await send_queued_message(c.message.chat.id, c.from_user.id, f"📍 {display}\n🌙 Ramazon {day}-kun ({date_str})\n\n⏰ Saharlik: {fajr}\n🌇 Iftorlik: {shom}\n\nDuo ko'rish uchun tanlang:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("time:"))
 async def cb_time(c: CallbackQuery):
@@ -936,7 +994,7 @@ async def cb_duo_del(c: CallbackQuery):
     except:
         await send_queued_message(c.message.chat.id, c.from_user.id, f"✅ Duo '{title}' o'chirildi.")
 
-@dp.message(StateDuoAdd.waiting_title)
+@dp.message(StateDuoAdd.waiting_title, F.text)
 async def duo_title(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id):
         await state.clear()
@@ -945,10 +1003,14 @@ async def duo_title(m: Message, state: FSMContext):
     await state.set_state(StateDuoAdd.waiting_text)
     await m.answer("Duo matnini yuboring:")
 
-@dp.message(StateDuoAdd.waiting_text)
+@dp.message(StateDuoAdd.waiting_text, F.text)
 async def duo_text(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id):
         await state.clear()
+        return
+    # Only accept text, not media
+    if not m.text:
+        await m.answer("Iltimos, faqat matn yuboring (rasm/video emas).")
         return
     data = await state.get_data()
     title = data.get('title') or "No title"
@@ -968,6 +1030,9 @@ async def cb_watch(c: CallbackQuery):
     await c.answer()
     if is_duplicate_callback(c.from_user.id, c.data):
         return
+    # Check for video navigation spam
+    if is_video_nav_spam(c.from_user.id):
+        return
     kind = c.data.split(":", 1)[1]
     playlist = get_filtered(kind)
     if not playlist:
@@ -984,6 +1049,9 @@ async def cb_watch(c: CallbackQuery):
 async def cb_video_nav(c: CallbackQuery):
     await c.answer()
     if is_duplicate_callback(c.from_user.id, c.data):
+        return
+    # Check for video navigation spam - prevent rapid button clicks
+    if is_video_nav_spam(c.from_user.id):
         return
     parts = c.data.split(":")
     if len(parts) < 3:
