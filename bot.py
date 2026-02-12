@@ -1,4 +1,10 @@
 # ramazon_bot_full_with_videos.py
+from db import init_db
+
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
+
 """
 Ramazon bot (to'liq) — token .env dan olinadi.
 Funktsiyalar:
@@ -19,7 +25,9 @@ from openpyxl import Workbook
 import os
 import json
 import re
-from typing import Optional
+from typing import Optional, Callable, Dict, Any, Awaitable
+
+from db import init_db as init_user_db, add_or_update_user, get_total_users, get_monthly_users, get_all_user_ids
 
 from dotenv import load_dotenv
 load_dotenv()  # load .env from project root
@@ -33,6 +41,20 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+
+class UserActivityMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user:
+            await add_or_update_user(user.id)
+        return await handler(event, data)
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -265,7 +287,7 @@ def is_duplicate_callback(user_id: int, callback_data: str) -> bool:
 
 # Video navigation debounce - tracks ANY video button press, not just same button
 LAST_VIDEO_NAV = {}  # user_id -> timestamp
-VIDEO_NAV_DEBOUNCE = 1.5  # seconds between ANY video navigation
+VIDEO_NAV_DEBOUNCE = 0.4  # seconds between ANY video navigation
 
 def is_video_nav_spam(user_id: int) -> bool:
     """Check if user is spamming video navigation buttons"""
@@ -755,6 +777,20 @@ async def daily_namaz_updater_loop():
         try:
             await refresh_prayer_cache_for_all()
             log.info("Daily namaz times refreshed at Tashkent midnight.")
+            
+            # Broadcast menu to all users (using new db logic)
+            user_ids = await get_all_user_ids()
+            kb = build_main_inline()
+            sent_count = 0
+            for uid in user_ids:
+                try:
+                    await bot.send_message(uid, "🌙 Yangi kun muborak! Bugungi menyu:", reply_markup=kb)
+                    sent_count += 1
+                    await asyncio.sleep(0.05)
+                except:
+                    pass
+            log.info("Daily menu broadcast to %s users", sent_count)
+            
         except Exception as e:
             log.exception("daily_namaz_updater_loop error: %s", e)
         await asyncio.sleep(1)
@@ -775,7 +811,11 @@ async def cmd_start(message: Message):
     
     first = message.from_user.first_name or "Do'st"
     username = message.from_user.username
+    
+    # DB updates (Old DB + New DB)
     await add_user_db(message.from_user.id, first, username)
+    await add_or_update_user(message.from_user.id)
+    
     await message.answer(f"Assalomu alaykum, {first}!\n🌙 Ramazon Muborak", reply_markup=build_main_inline())
 
 @dp.callback_query(lambda c: c.data == "menu:ramadan")
@@ -1023,6 +1063,8 @@ async def cb_videos_menu(c: CallbackQuery):
     await c.answer()
     if is_duplicate_callback(c.from_user.id, c.data):
         return
+    # Clear region selection (dynamic menu requirement)
+    await set_user_region_db(c.from_user.id, None)
     await send_queued_message(c.message.chat.id, c.from_user.id, "Domlolar va Hadislar videolari:", reply_markup=video_kind_kb())
 
 @dp.callback_query(F.data.startswith("watch:"))
@@ -1119,6 +1161,15 @@ async def cmd_admin(m: Message):
         return await m.reply("Admin emassiz.")
     await m.answer("🔐 Admin panel", reply_markup=build_admin_reply_kb())
 
+@dp.message(Command("stats"))
+async def cmd_stats(m: Message):
+    if not await is_admin(m.from_user.id):
+        return
+    total = await get_total_users()
+    monthly = await get_monthly_users()
+    await m.answer(f"📊 Statistika (bot.db):\n\n👥 Jami userlar: {total}\n📅 Shu oy aktiv: {monthly}")
+
+
 @dp.message(F.text == "📊 Statistika")
 async def admin_stats(m: Message):
     if not await is_admin(m.from_user.id):
@@ -1169,6 +1220,13 @@ async def admin_duo_excel(m: Message):
     wb.save(path)
     await m.answer_document(FSInputFile(path))
     os.remove(path)
+
+@dp.message(F.text == "➕ Duo qo'shish")
+async def admin_duo_add_text_handler(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id):
+        return
+    await state.set_state(StateDuoAdd.waiting_title)
+    await m.answer("Duo nomini kiriting:")
 
 @dp.message(F.text == "📢 Reklama yuborish")
 async def admin_broadcast_start(m: Message, state: FSMContext):
@@ -1414,6 +1472,10 @@ async def periodic_cache():
 
 async def on_startup():
     await init_db()
+    await init_user_db()  # New DB init
+    dp.message.middleware(UserActivityMiddleware())
+    dp.callback_query.middleware(UserActivityMiddleware())
+    
     await load_admins_from_db()
     log.info("DB tayyor, admins: %s", ADMINS)
     await refresh_prayer_cache_for_all()
